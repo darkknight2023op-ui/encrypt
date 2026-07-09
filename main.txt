@@ -1,0 +1,175 @@
+"""
+FULL QUANTUM-SECURE ENCRYPTION PIPELINE
+BB84 Quantum Key Distribution (with eavesdropper detection)
+  -> One-Time Pad encryption of the actual data
+"""
+
+import random
+from qiskit import QuantumCircuit
+from qiskit_aer import AerSimulator
+
+sim = AerSimulator()
+
+
+# =========================================================
+# SECTION 1: BB84 QUANTUM KEY DISTRIBUTION
+# =========================================================
+def bb84_generate_key(num_qubits, eavesdropper_present=False):
+    """Alice and Bob exchange qubits to build a shared secret key.
+    If an eavesdropper (Eve) intercepts, it introduces detectable errors --
+    this is the core 'unbreakable if tampered' property of quantum crypto."""
+
+    alice_bits = [random.randint(0, 1) for _ in range(num_qubits)]
+    alice_bases = [random.choice(['Z', 'X']) for _ in range(num_qubits)]
+    bob_bases = [random.choice(['Z', 'X']) for _ in range(num_qubits)]
+    bob_results = []
+
+    for i in range(num_qubits):
+        qc = QuantumCircuit(1, 1)
+
+        # Alice encodes her bit
+        if alice_bits[i] == 1:
+            qc.x(0)
+        if alice_bases[i] == 'X':
+            qc.h(0)
+
+        # Eve intercepts and measures in a random (wrong-guess) basis, then re-sends
+        if eavesdropper_present:
+            eve_basis = random.choice(['Z', 'X'])
+            if eve_basis == 'X':
+                qc.h(0)
+            qc.measure(0, 0)
+            qc.reset(0)
+            # Eve re-prepares the qubit based on what she measured (imperfect -- this is what causes errors)
+            eve_result = sim.run(qc, shots=1).result()
+            # (simplified: in a real run we'd re-encode; here Eve's disturbance
+            # is modeled by the extra measure+reset collapsing the state)
+            if eve_basis == 'X':
+                qc.h(0)
+
+        # Bob measures in his own randomly chosen basis
+        if bob_bases[i] == 'X':
+            qc.h(0)
+        qc.measure(0, 0)
+
+        result = sim.run(qc, shots=1).result()
+        bit = int(list(result.get_counts().keys())[0])
+        bob_results.append(bit)
+
+    return alice_bits, alice_bases, bob_bases, bob_results
+
+
+# =========================================================
+# SECTION 2: BASIS RECONCILIATION + EAVESDROPPER DETECTION
+# =========================================================
+def sift_and_check(alice_bits, alice_bases, bob_bases, bob_results, sample_fraction=0.2):
+    """Keep only the bits where Alice and Bob used the same basis.
+    Then publicly compare a small sample to check for eavesdropping --
+    if error rate is high, someone was listening in."""
+
+    matching = [i for i in range(len(alice_bases)) if alice_bases[i] == bob_bases[i]]
+    sifted_alice = [alice_bits[i] for i in matching]
+    sifted_bob = [bob_results[i] for i in matching]
+
+    sample_size = max(1, int(len(sifted_alice) * sample_fraction))
+    sample_indices = random.sample(range(len(sifted_alice)), sample_size)
+
+    errors = sum(1 for i in sample_indices if sifted_alice[i] != sifted_bob[i])
+    error_rate = errors / sample_size
+
+    # remove the sampled/revealed bits -- they were exposed publicly, can't use them as secret key
+    final_alice = [b for i, b in enumerate(sifted_alice) if i not in sample_indices]
+    final_bob = [b for i, b in enumerate(sifted_bob) if i not in sample_indices]
+
+    eavesdropper_detected = error_rate > 0.1  # threshold -- real BB84 uses ~11%
+
+    return final_alice, final_bob, error_rate, eavesdropper_detected
+
+
+# =========================================================
+# SECTION 3: KEY -> BYTES
+# =========================================================
+def bits_to_key_bytes(bit_list, num_bytes):
+    bitstring = ''.join(str(b) for b in bit_list)
+    key_bytes = []
+    for i in range(num_bytes):
+        byte_bits = bitstring[i*8:(i+1)*8]
+        key_bytes.append(int(byte_bits, 2))
+    return key_bytes
+
+
+# =========================================================
+# SECTION 4: FILE HANDLING
+# =========================================================
+def read_file_as_bytes(filepath):
+    with open(filepath, 'rb') as f:
+        return f.read()
+
+def write_bytes_to_file(filepath, data_bytes):
+    with open(filepath, 'wb') as f:
+        f.write(data_bytes)
+
+
+# =========================================================
+# SECTION 5: ONE-TIME PAD ENCRYPTION / DECRYPTION
+# =========================================================
+def encrypt(data_bytes, key_bytes):
+    return bytes(d ^ k for d, k in zip(data_bytes, key_bytes))
+
+def decrypt(cipher_bytes, key_bytes):
+    return bytes(c ^ k for c, k in zip(cipher_bytes, key_bytes))
+
+
+# =========================================================
+# SECTION 6: FULL PIPELINE
+# =========================================================
+def run_pipeline(input_file, eavesdropper_present=False):
+    data = read_file_as_bytes(input_file)
+    num_bytes = len(data)
+    bits_needed = num_bytes * 8
+
+    # BB84 needs ~4x the bits due to basis mismatch (~50%) + sample check (~20% revealed)
+    num_qubits = bits_needed * 4
+
+    print(f"\n{'='*50}")
+    print(f"Eavesdropper present: {eavesdropper_present}")
+    print(f"{'='*50}")
+
+    a_bits, a_bases, b_bases, b_results = bb84_generate_key(num_qubits, eavesdropper_present)
+    final_alice, final_bob, error_rate, detected = sift_and_check(a_bits, a_bases, b_bases, b_results)
+
+    print(f"Error rate in sample check: {error_rate:.1%}")
+    print(f"Eavesdropper detected: {detected}")
+
+    if detected:
+        print("ABORTING key exchange -- channel is not secure!")
+        return
+
+    if len(final_alice) < bits_needed:
+        print(f"Not enough key bits survived ({len(final_alice)} < {bits_needed} needed) -- would request more qubits in practice.")
+        return
+
+    key = bits_to_key_bytes(final_alice[:bits_needed], num_bytes)
+    print(f"Shared secret key established ({len(key)} bytes)")
+
+    cipher = encrypt(data, key)
+
+    # ---- save and show the encrypted data ----
+    encrypted_filename = input_file + ".encrypted"
+    write_bytes_to_file(encrypted_filename, cipher)
+    print(f"\n[ENCRYPTED] Saved to: {encrypted_filename}")
+    print(f"[ENCRYPTED] First 100 bytes (raw numbers): {list(cipher[:100])}")
+    print(f"[ENCRYPTED] As hex: {cipher[:50].hex()}")
+
+    recovered = decrypt(cipher, key)
+
+    decrypted_filename = input_file + ".decrypted"
+    write_bytes_to_file(decrypted_filename, recovered)
+    print(f"\n[DECRYPTED] Saved to: {decrypted_filename}")
+
+    print(f"\nDecryption successful: {recovered == data}")
+
+
+if __name__ == "__main__":
+    run_pipeline("sample_data.csv", eavesdropper_present=False)
+    run_pipeline("sample_data.csv", eavesdropper_present=True)
