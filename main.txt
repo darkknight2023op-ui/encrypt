@@ -1,10 +1,10 @@
 """
-FULL QUANTUM-SECURE ENCRYPTION PIPELINE
-BB84 Quantum Key Distribution (with eavesdropper detection)
-  -> One-Time Pad encryption of the actual data
+QUANTUM-SECURE ENCRYPTION -- FULL PIPELINE
+BB84 Key Distribution + Privacy Amplification + One-Time Pad + Integrity Check
 """
 
 import random
+import hashlib
 from qiskit import QuantumCircuit
 from qiskit_aer import AerSimulator
 
@@ -16,8 +16,8 @@ sim = AerSimulator()
 # =========================================================
 def bb84_generate_key(num_qubits, eavesdropper_present=False):
     """Alice and Bob exchange qubits to build a shared secret key.
-    If an eavesdropper (Eve) intercepts, it introduces detectable errors --
-    this is the core 'unbreakable if tampered' property of quantum crypto."""
+    An eavesdropper (Eve) intercepting the qubits introduces detectable
+    errors -- this is the core security guarantee of quantum key exchange."""
 
     alice_bits = [random.randint(0, 1) for _ in range(num_qubits)]
     alice_bases = [random.choice(['Z', 'X']) for _ in range(num_qubits)]
@@ -33,17 +33,14 @@ def bb84_generate_key(num_qubits, eavesdropper_present=False):
         if alice_bases[i] == 'X':
             qc.h(0)
 
-        # Eve intercepts and measures in a random (wrong-guess) basis, then re-sends
+        # Eve intercepts, measures (disturbing the qubit), and re-sends
         if eavesdropper_present:
             eve_basis = random.choice(['Z', 'X'])
             if eve_basis == 'X':
                 qc.h(0)
             qc.measure(0, 0)
             qc.reset(0)
-            # Eve re-prepares the qubit based on what she measured (imperfect -- this is what causes errors)
-            eve_result = sim.run(qc, shots=1).result()
-            # (simplified: in a real run we'd re-encode; here Eve's disturbance
-            # is modeled by the extra measure+reset collapsing the state)
+            sim.run(qc, shots=1).result()
             if eve_basis == 'X':
                 qc.h(0)
 
@@ -63,9 +60,8 @@ def bb84_generate_key(num_qubits, eavesdropper_present=False):
 # SECTION 2: BASIS RECONCILIATION + EAVESDROPPER DETECTION
 # =========================================================
 def sift_and_check(alice_bits, alice_bases, bob_bases, bob_results, sample_fraction=0.2):
-    """Keep only the bits where Alice and Bob used the same basis.
-    Then publicly compare a small sample to check for eavesdropping --
-    if error rate is high, someone was listening in."""
+    """Keep only bits where Alice and Bob's random bases matched.
+    Publicly compare a sample to check for eavesdropping."""
 
     matching = [i for i in range(len(alice_bases)) if alice_bases[i] == bob_bases[i]]
     sifted_alice = [alice_bits[i] for i in matching]
@@ -77,7 +73,6 @@ def sift_and_check(alice_bits, alice_bases, bob_bases, bob_results, sample_fract
     errors = sum(1 for i in sample_indices if sifted_alice[i] != sifted_bob[i])
     error_rate = errors / sample_size
 
-    # remove the sampled/revealed bits -- they were exposed publicly, can't use them as secret key
     final_alice = [b for i, b in enumerate(sifted_alice) if i not in sample_indices]
     final_bob = [b for i, b in enumerate(sifted_bob) if i not in sample_indices]
 
@@ -87,19 +82,36 @@ def sift_and_check(alice_bits, alice_bases, bob_bases, bob_results, sample_fract
 
 
 # =========================================================
-# SECTION 3: KEY -> BYTES
+# SECTION 3: HASHING -- PRIVACY AMPLIFICATION
 # =========================================================
-def bits_to_key_bytes(bit_list, num_bytes):
+def privacy_amplify(bit_list, output_bytes):
+    """Hashes the raw sifted key using SHA-256 before using it.
+    Even if Eve learned a tiny partial fragment of the key that didn't
+    trip the error-rate alarm, hashing destroys that partial knowledge --
+    the avalanche effect means a fragment is useless for reconstruction."""
     bitstring = ''.join(str(b) for b in bit_list)
-    key_bytes = []
-    for i in range(num_bytes):
-        byte_bits = bitstring[i*8:(i+1)*8]
-        key_bytes.append(int(byte_bits, 2))
-    return key_bytes
+    raw_bytes = int(bitstring, 2).to_bytes((len(bitstring) + 7) // 8, 'big')
+
+    key = b''
+    counter = 0
+    while len(key) < output_bytes:
+        key += hashlib.sha256(raw_bytes + counter.to_bytes(4, 'big')).digest()
+        counter += 1
+    return key[:output_bytes]
 
 
 # =========================================================
-# SECTION 4: FILE HANDLING
+# SECTION 4: HASHING -- INTEGRITY CHECK
+# =========================================================
+def compute_integrity_hash(data_bytes):
+    """A fingerprint of the data. If even one byte is tampered with
+    in transit, this hash won't match anymore -- catching tampering,
+    which is a separate guarantee from confidentiality."""
+    return hashlib.sha256(data_bytes).hexdigest()
+
+
+# =========================================================
+# SECTION 5: FILE HANDLING (works for ANY file type)
 # =========================================================
 def read_file_as_bytes(filepath):
     with open(filepath, 'rb') as f:
@@ -111,7 +123,7 @@ def write_bytes_to_file(filepath, data_bytes):
 
 
 # =========================================================
-# SECTION 5: ONE-TIME PAD ENCRYPTION / DECRYPTION
+# SECTION 6: ONE-TIME PAD ENCRYPTION / DECRYPTION
 # =========================================================
 def encrypt(data_bytes, key_bytes):
     return bytes(d ^ k for d, k in zip(data_bytes, key_bytes))
@@ -121,55 +133,64 @@ def decrypt(cipher_bytes, key_bytes):
 
 
 # =========================================================
-# SECTION 6: FULL PIPELINE
+# SECTION 7: FULL PIPELINE
 # =========================================================
-def run_pipeline(input_file, eavesdropper_present=False):
+def run_pipeline(input_file, eavesdropper_present=False, simulate_tampering=False):
     data = read_file_as_bytes(input_file)
     num_bytes = len(data)
     bits_needed = num_bytes * 8
+    num_qubits = bits_needed * 4  # ~4x needed: basis mismatch + sample check overhead
 
-    # BB84 needs ~4x the bits due to basis mismatch (~50%) + sample check (~20% revealed)
-    num_qubits = bits_needed * 4
+    print(f"\n{'='*55}")
+    print(f"File: {input_file} ({num_bytes} bytes)")
+    print(f"Eavesdropper present: {eavesdropper_present} | Tampering test: {simulate_tampering}")
+    print(f"{'='*55}")
 
-    print(f"\n{'='*50}")
-    print(f"Eavesdropper present: {eavesdropper_present}")
-    print(f"{'='*50}")
-
+    # ---- STEP 1: Quantum key exchange ----
     a_bits, a_bases, b_bases, b_results = bb84_generate_key(num_qubits, eavesdropper_present)
-    final_alice, final_bob, error_rate, detected = sift_and_check(a_bits, a_bases, b_bases, b_results)
 
+    # ---- STEP 2: Sift + detect eavesdropping ----
+    final_alice, final_bob, error_rate, detected = sift_and_check(a_bits, a_bases, b_bases, b_results)
     print(f"Error rate in sample check: {error_rate:.1%}")
     print(f"Eavesdropper detected: {detected}")
 
     if detected:
-        print("ABORTING key exchange -- channel is not secure!")
+        print("ABORTING -- channel is not secure!")
         return
-
     if len(final_alice) < bits_needed:
-        print(f"Not enough key bits survived ({len(final_alice)} < {bits_needed} needed) -- would request more qubits in practice.")
+        print(f"Not enough key bits survived ({len(final_alice)} < {bits_needed} needed).")
         return
 
-    key = bits_to_key_bytes(final_alice[:bits_needed], num_bytes)
-    print(f"Shared secret key established ({len(key)} bytes)")
+    # ---- STEP 3: Privacy amplification (hashing) ----
+    key = privacy_amplify(final_alice[:bits_needed], num_bytes)
+    print(f"Key established + privacy-amplified via SHA-256 ({len(key)} bytes)")
 
+    # ---- STEP 4: Record integrity fingerprint of original data ----
+    original_hash = compute_integrity_hash(data)
+
+    # ---- STEP 5: Encrypt ----
     cipher = encrypt(data, key)
+    write_bytes_to_file(input_file + ".encrypted", cipher)
+    print(f"[ENCRYPTED] Saved: {input_file}.encrypted")
+    print(f"[ENCRYPTED] Hex preview: {cipher[:40].hex()}")
 
-    # ---- save and show the encrypted data ----
-    encrypted_filename = input_file + ".encrypted"
-    write_bytes_to_file(encrypted_filename, cipher)
-    print(f"\n[ENCRYPTED] Saved to: {encrypted_filename}")
-    print(f"[ENCRYPTED] First 100 bytes (raw numbers): {list(cipher[:100])}")
-    print(f"[ENCRYPTED] As hex: {cipher[:50].hex()}")
+    if simulate_tampering:
+        cipher = bytearray(cipher)
+        cipher[0] ^= 0xFF
+        cipher = bytes(cipher)
+        print("[SIMULATED] Ciphertext tampered with in transit!")
 
+    # ---- STEP 6: Decrypt + verify ----
     recovered = decrypt(cipher, key)
+    write_bytes_to_file(input_file + ".decrypted", recovered)
+    recovered_hash = compute_integrity_hash(recovered)
 
-    decrypted_filename = input_file + ".decrypted"
-    write_bytes_to_file(decrypted_filename, recovered)
-    print(f"\n[DECRYPTED] Saved to: {decrypted_filename}")
-
-    print(f"\nDecryption successful: {recovered == data}")
+    print(f"[DECRYPTED] Saved: {input_file}.decrypted")
+    print(f"Decryption byte-match: {recovered == data}")
+    print(f"Integrity check passed (hashing): {original_hash == recovered_hash}")
 
 
 if __name__ == "__main__":
-    run_pipeline("sample_data.csv", eavesdropper_present=False)
-    run_pipeline("sample_data.csv", eavesdropper_present=True)
+    run_pipeline("sample_data.csv", eavesdropper_present=False, simulate_tampering=False)
+    run_pipeline("sample_data.csv", eavesdropper_present=True,  simulate_tampering=False)
+    run_pipeline("sample_data.csv", eavesdropper_present=False, simulate_tampering=True)
